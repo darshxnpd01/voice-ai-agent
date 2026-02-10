@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import logging
 import websockets
+import plivo
 
 load_dotenv()
 
@@ -26,34 +27,69 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+PLIVO_NUMBER = os.getenv("PLIVO_NUMBER", "19182150247")
 
 # OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Plivo client for SMS
+plivo_client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 
 # Store conversation state per call
 conversations = {}
 
 SYSTEM_PROMPT = """You are a friendly AI receptionist for Mario's Italian Kitchen restaurant. Help callers make reservations.
 
-Collect: date, time, party size, and name for the reservation.
+You need to collect:
+1. Date (when they want to come)
+2. Time (preferred time)
+3. Party size (number of people)
+4. Name (for the reservation)
 
 Available dinner times: 5:30 PM, 6:00 PM, 6:30 PM, 7:00 PM, 7:30 PM, 8:00 PM
 
-Rules:
-- Keep responses to 1-2 SHORT sentences
-- Ask for ONE piece of info at a time
-- Once you have all info, confirm and say goodbye"""
+IMPORTANT RULES:
+- Keep responses to 1-2 SHORT sentences only
+- Ask for ONE piece of information at a time
+- If the user says something unclear, off-topic, or irrelevant, politely say "Sorry, I didn't catch that. Could you please repeat?"
+- If the user says something that doesn't make sense for a reservation (like random words, unrelated topics), ask them to clarify
+- Once you have ALL info (date, time, party size, name), confirm the reservation and say "Your reservation is confirmed! Goodbye!"
+- Always be polite and patient
+
+Examples of irrelevant input to handle:
+- Random words or sounds -> "Sorry, I didn't catch that. Could you please repeat?"
+- Unrelated questions -> "I can only help with reservations. What date would you like to book?"
+- Unclear responses -> "I didn't understand. Could you say that again?"
+"""
 
 GREETING = "Hi, thanks for calling Mario's Italian Kitchen! I can help you make a reservation. What date were you thinking?"
 
 
 class ConversationState:
-    def __init__(self, call_uuid: str):
+    def __init__(self, call_uuid: str, caller_number: str = None):
         self.call_uuid = call_uuid
+        self.caller_number = caller_number
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.reservation = {
+            "date": None,
+            "time": None,
+            "party_size": None,
+            "name": None
+        }
+        self.misheard_count = 0  # Track consecutive misheard inputs
+        self.is_speaking = False  # Track if agent is currently speaking (for barge-in)
+        self.reservation_confirmed = False
+        self.barge_in_counter = 0  # Count consecutive high-energy chunks for barge-in
 
     def add_message(self, role: str, content: str):
         self.messages.append({"role": role, "content": content})
+
+    def increment_misheard(self):
+        self.misheard_count += 1
+        return self.misheard_count
+
+    def reset_misheard(self):
+        self.misheard_count = 0
 
 
 async def text_to_speech_elevenlabs(text: str) -> bytes:
@@ -82,22 +118,94 @@ async def text_to_speech_elevenlabs(text: str) -> bytes:
 
 
 def get_llm_response(conversation: ConversationState, user_input: str) -> str:
-    """Get response from OpenAI"""
+    """Get response from OpenAI with error handling for irrelevant input"""
+
+    # Check for very short or potentially misheard input
+    if len(user_input.strip()) < 2:
+        conversation.increment_misheard()
+        return "Sorry, I didn't catch that. Could you please repeat?"
+
     conversation.add_message("user", user_input)
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=conversation.messages,
-            max_tokens=100,
+            max_tokens=150,
             temperature=0.7
         )
         assistant_message = response.choices[0].message.content
         conversation.add_message("assistant", assistant_message)
+
+        # Check if this is a clarification request (misheard handling)
+        clarification_phrases = ["didn't catch", "didn't understand", "could you repeat", "say that again", "please repeat"]
+        if any(phrase in assistant_message.lower() for phrase in clarification_phrases):
+            conversation.increment_misheard()
+        else:
+            conversation.reset_misheard()
+
+        # Check if reservation is confirmed
+        if "confirmed" in assistant_message.lower() and "goodbye" in assistant_message.lower():
+            conversation.reservation_confirmed = True
+            # Extract reservation details from conversation
+            extract_reservation_details(conversation)
+
         return assistant_message
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
-        return "Sorry, could you repeat that?"
+        return "Sorry, I'm having trouble understanding. Could you please repeat that?"
+
+
+def extract_reservation_details(conversation: ConversationState):
+    """Extract reservation details from conversation for SMS confirmation"""
+    try:
+        # Use GPT to extract details
+        extract_prompt = """Based on the conversation, extract the reservation details in JSON format:
+        {"date": "...", "time": "...", "party_size": "...", "name": "..."}
+        Only return the JSON, nothing else."""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=conversation.messages + [{"role": "user", "content": extract_prompt}],
+            max_tokens=100,
+            temperature=0
+        )
+
+        details = json.loads(response.choices[0].message.content)
+        conversation.reservation = details
+        logger.info(f"📋 Reservation extracted: {details}")
+    except Exception as e:
+        logger.error(f"Failed to extract reservation: {e}")
+
+
+async def send_sms_confirmation(conversation: ConversationState):
+    """Send SMS confirmation after reservation is complete"""
+    if not conversation.caller_number or not conversation.reservation_confirmed:
+        return
+
+    try:
+        # Format the SMS message
+        r = conversation.reservation
+        sms_message = f"""🍝 Mario's Italian Kitchen - Reservation Confirmed!
+
+📅 Date: {r.get('date', 'N/A')}
+🕐 Time: {r.get('time', 'N/A')}
+👥 Party Size: {r.get('party_size', 'N/A')}
+📛 Name: {r.get('name', 'N/A')}
+
+Thank you for choosing Mario's! We look forward to seeing you.
+
+To modify or cancel, call us at +1 (918) 215-0247"""
+
+        # Send SMS via Plivo
+        plivo_client.messages.create(
+            src=PLIVO_NUMBER,
+            dst=conversation.caller_number,
+            text=sms_message
+        )
+        logger.info(f"📱 SMS confirmation sent to {conversation.caller_number}")
+    except Exception as e:
+        logger.error(f"SMS error: {e}")
 
 
 def convert_mp3_to_mulaw(mp3_data: bytes) -> bytes:
@@ -141,7 +249,8 @@ async def answer_call(request: Request):
 
     logger.info(f"📞 Incoming call: {call_uuid} from {from_number}")
 
-    conversations[call_uuid] = ConversationState(call_uuid)
+    # Store caller number for SMS follow-up
+    conversations[call_uuid] = ConversationState(call_uuid, from_number)
 
     host = request.headers.get("host", "localhost:8000")
     ws_url = f"wss://{host}/ws/audio/{call_uuid}"
@@ -159,7 +268,14 @@ async def hangup_call(request: Request):
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID", "unknown")
     logger.info(f"📴 Call ended: {call_uuid}")
-    conversations.pop(call_uuid, None)
+
+    # Send SMS confirmation if reservation was made
+    if call_uuid in conversations:
+        conversation = conversations[call_uuid]
+        if conversation.reservation_confirmed:
+            asyncio.create_task(send_sms_confirmation(conversation))
+        conversations.pop(call_uuid, None)
+
     return {"status": "ok"}
 
 
@@ -173,10 +289,6 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
         conversations[call_uuid] = ConversationState(call_uuid)
     conversation = conversations[call_uuid]
 
-    # Audio buffer for collecting speech
-    audio_buffer = bytearray()
-    is_speaking = False
-    silence_count = 0
     greeting_sent = False
     processing_lock = asyncio.Lock()
 
@@ -186,7 +298,7 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
 
     async def connect_deepgram():
         """Connect to Deepgram streaming STT"""
-        url = f"wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&punctuate=true&interim_results=false"
+        url = f"wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&punctuate=true&interim_results=false&endpointing=300"
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
         try:
@@ -210,12 +322,26 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
         except Exception as e:
             logger.error(f"Deepgram receive error: {e}")
 
+    async def clear_audio_queue():
+        """Send clearAudio event to stop current playback (barge-in)"""
+        try:
+            msg = {"event": "clearAudio"}
+            await websocket.send_text(json.dumps(msg))
+            logger.info("🛑 Audio cleared (barge-in)")
+        except Exception as e:
+            logger.error(f"Clear audio error: {e}")
+
     async def send_audio_to_plivo(audio_bytes: bytes):
         """Send audio to Plivo in proper chunks (≤16KB base64)"""
-        # 16KB base64 = ~12KB raw bytes (base64 expands by ~33%)
-        max_chunk_raw = 8000  # 8KB raw = ~11KB base64, safe margin
+        conversation.is_speaking = True
+        max_chunk_raw = 8000  # 8KB raw = ~11KB base64
 
         for i in range(0, len(audio_bytes), max_chunk_raw):
+            # Check if we should stop (barge-in detected)
+            if not conversation.is_speaking:
+                logger.info("🛑 Stopping audio send (interrupted)")
+                break
+
             chunk = audio_bytes[i:i + max_chunk_raw]
             payload = base64.b64encode(chunk).decode()
 
@@ -230,21 +356,26 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
 
             try:
                 await websocket.send_text(json.dumps(msg))
-                # Wait a bit to not overwhelm the buffer
-                # 8000 bytes at 8kHz = 1 second of audio
-                await asyncio.sleep(0.5)  # Send chunks with some spacing
+                await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Send error: {e}")
                 break
+
+        conversation.is_speaking = False
 
     async def process_and_respond(transcript: str):
         """Process transcript and send response"""
         async with processing_lock:
             logger.info(f"🤖 Processing: {transcript}")
 
-            # Get LLM response
+            # Get LLM response with error handling
             response_text = get_llm_response(conversation, transcript)
             logger.info(f"💬 Response: {response_text}")
+
+            # Check if too many misheard attempts
+            if conversation.misheard_count >= 3:
+                response_text = "I'm having trouble understanding. Let me transfer you to a staff member. Please hold."
+                logger.info("⚠️ Too many misheard attempts")
 
             # Convert to speech
             audio = await text_to_speech_elevenlabs(response_text)
@@ -253,19 +384,19 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
                     None, convert_mp3_to_mulaw, audio
                 )
                 if mulaw:
-                    logger.info(f"🔊 Sending {len(mulaw)} bytes in chunks")
+                    logger.info(f"🔊 Sending {len(mulaw)} bytes")
                     await send_audio_to_plivo(mulaw)
 
     async def send_greeting():
         """Send initial greeting"""
-        logger.info("🎙️ Generating greeting...")
+        logger.info("🎙️ Sending greeting...")
         audio = await text_to_speech_elevenlabs(GREETING)
         if audio:
             mulaw = await asyncio.get_event_loop().run_in_executor(
                 None, convert_mp3_to_mulaw, audio
             )
             if mulaw:
-                logger.info(f"📤 Sending greeting: {len(mulaw)} bytes")
+                logger.info(f"📤 Greeting: {len(mulaw)} bytes")
                 await send_audio_to_plivo(mulaw)
                 logger.info("✅ Greeting sent")
 
@@ -280,7 +411,6 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
     try:
         while True:
             try:
-                # Use wait_for with a short timeout to allow checking transcript queue
                 try:
                     data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
                     msg = json.loads(data)
@@ -288,8 +418,6 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
 
                     if event == "start":
                         logger.info(f"▶️ Stream started")
-
-                        # Send greeting
                         if not greeting_sent:
                             greeting_sent = True
                             asyncio.create_task(send_greeting())
@@ -299,7 +427,7 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
                         if payload:
                             chunk = base64.b64decode(payload)
 
-                            # Send to Deepgram for real-time transcription
+                            # Send to Deepgram (barge-in disabled - was too sensitive)
                             if deepgram_ws:
                                 try:
                                     await deepgram_ws.send(chunk)
@@ -330,11 +458,15 @@ async def audio_websocket(websocket: WebSocket, call_uuid: str):
     except Exception as e:
         logger.error(f"❌ Error: {e}")
     finally:
-        # Cleanup
         if deepgram_ws:
             await deepgram_ws.close()
         if deepgram_task:
             deepgram_task.cancel()
+
+        # Send SMS if reservation confirmed
+        if conversation.reservation_confirmed:
+            asyncio.create_task(send_sms_confirmation(conversation))
+
         conversations.pop(call_uuid, None)
 
 

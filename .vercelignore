@@ -1,0 +1,6 @@
+.env
+ngrok.log
+server.log
+__pycache__/
+*.pyc
+.git/

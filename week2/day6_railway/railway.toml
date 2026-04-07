@@ -1,0 +1,25 @@
+# Railway deployment configuration
+# This file tells Railway how to build and run your service
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python server.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Environment variables are set in Railway dashboard, NOT here
+# Required variables to add in Railway dashboard:
+#   OPENAI_API_KEY
+#   DEEPGRAM_API_KEY
+#   ELEVENLABS_API_KEY
+#   PLIVO_AUTH_ID
+#   PLIVO_AUTH_TOKEN
+#   PLIVO_NUMBER
+#   POSTGRES_URL   (from Vercel — copy POSTGRES_URL_NON_POOLING value)
+#   REDIS_URL      (from Vercel — copy KV_URL value)
+#   WEBSOCKET_BASE_URL  (your Railway domain, e.g. "your-app.up.railway.app")

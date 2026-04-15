@@ -8,7 +8,7 @@ import os, json, urllib.parse
 from datetime import datetime, timezone
 
 
-def store_session(caller_id: str):
+def store_session(caller_id: str, called_id: str, call_uuid: str):
     """Store call session in Redis via Upstash REST API."""
     url   = os.getenv("KV_REST_API_URL", "")
     token = os.getenv("KV_REST_API_TOKEN", "")
@@ -16,7 +16,14 @@ def store_session(caller_id: str):
         return
     import urllib.request
     key  = f"session:{caller_id}"
-    data = json.dumps({"step": "greeting", "started_at": datetime.now(timezone.utc).isoformat()})
+    data = json.dumps({
+        "step": "greeting",
+        "from": caller_id,
+        "to": called_id,
+        "call_uuid": call_uuid,
+        "digit_pressed": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
     req  = urllib.request.Request(
         f"{url}/set/{urllib.parse.quote(key)}/{urllib.parse.quote(data)}?ex=1800",
         method="GET",
@@ -28,7 +35,7 @@ def store_session(caller_id: str):
         pass
 
 
-def log_call_db(caller: str, called: str):
+def log_call_db(caller: str, called: str, call_uuid: str):
     """Insert a call_log row into Postgres."""
     url = os.getenv("POSTGRES_URL", "") or os.getenv("POSTGRES_URL_NON_POOLING", "")
     if not url:
@@ -38,14 +45,15 @@ def log_call_db(caller: str, called: str):
         conn = psycopg2.connect(url)
         cur  = conn.cursor()
         cur.execute(
-            "INSERT INTO call_logs (caller_number, called_number, call_status, created_at) VALUES (%s, %s, 'started', NOW())",
-            (caller, called),
+            "INSERT INTO call_logs (caller_number, called_number, call_uuid, call_status, created_at) VALUES (%s, %s, %s, 'started', NOW())",
+            (caller, called, call_uuid),
         )
         conn.commit()
         cur.close()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        import sys
+        print(f"DB ERROR: {e}", file=sys.stderr)
 
 
 class handler(BaseHTTPRequestHandler):
@@ -54,15 +62,16 @@ class handler(BaseHTTPRequestHandler):
         body   = self.rfile.read(length).decode()
         params = dict(urllib.parse.parse_qsl(body))
 
-        caller = params.get("From", "unknown")
-        called = params.get("To", "unknown")
+        caller    = params.get("From", "unknown")
+        called    = params.get("To", "unknown")
+        call_uuid = params.get("CallUUID", "unknown")
 
-        store_session(caller)
-        log_call_db(caller, called)
+        store_session(caller, called, call_uuid)
+        log_call_db(caller, called, call_uuid)
 
         xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <GetDigits action="/api/handle-input" method="POST" numDigits="1" timeout="10" retries="3">
+  <GetDigits action="https://ivr-sessions.vercel.app/api/handle-input" method="POST" numDigits="1" timeout="10" retries="3">
     <Speak>Welcome to Mario's Italian Kitchen.
       Press 1 for hours and location.
       Press 2 to make a reservation.

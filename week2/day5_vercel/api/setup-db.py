@@ -22,10 +22,14 @@ class handler(BaseHTTPRequestHandler):
                         id SERIAL PRIMARY KEY,
                         caller_number TEXT,
                         called_number TEXT,
+                        call_uuid TEXT,
+                        digit_pressed TEXT,
                         call_status TEXT DEFAULT 'started',
                         created_at TIMESTAMPTZ DEFAULT NOW()
                     )
                 """)
+                cur.execute("ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS digit_pressed TEXT")
+                cur.execute("ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS call_uuid TEXT")
                 conn.commit()
                 cur.close()
                 conn.close()

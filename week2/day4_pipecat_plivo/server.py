@@ -97,26 +97,78 @@ SYSTEM_PROMPT = """You are a friendly AI receptionist for Mario's Italian Kitche
 You answer phone calls to help with reservations and questions.
 Keep ALL responses to 1-2 short sentences — this is a phone call.
 Be warm and natural. Never use bullet points.
-For reservations collect: name, date, time, party size — one at a time.
-Available times: 5:30 PM, 6:00 PM, 6:30 PM, 7:00 PM, 7:30 PM, 8:00 PM.
-Once you have ALL four details (name, date, time, party size), call save_reservation immediately."""
 
-RESERVATION_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "save_reservation",
-        "description": "Save a confirmed reservation to the database. Call this once you have collected name, date, time, and party size.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name":       {"type": "string",  "description": "Guest name"},
-                "date":       {"type": "string",  "description": "Reservation date e.g. 'February 10th'"},
-                "time":       {"type": "string",  "description": "Reservation time e.g. '6:00 PM'"},
-                "party_size": {"type": "integer", "description": "Number of guests"},
+When someone calls:
+1. Greet them: "Hello, thank you for calling Mario's Italian Kitchen. How can I help you today?"
+2. Listen to their request
+3. If they want to make a reservation: collect name, date, time, party size — one at a time. Then call save_reservation.
+4. If they ask about hours: call get_business_hours()
+5. If they ask about location: call get_location()
+6. If they want to speak to someone about an event or catering: call transfer_to_sales()
+7. If they have a complaint or issue with an order: call transfer_to_support()
+8. After handling any request, always ask: "Is there anything else I can help you with?"
+9. If you cannot hear or understand: say "I'm having trouble hearing you, could you repeat that?"
+10. When done: "Thank you for calling Mario's Italian Kitchen. Have a great day!"
+
+Available reservation times: 5:30 PM, 6:00 PM, 6:30 PM, 7:00 PM, 7:30 PM, 8:00 PM."""
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "save_reservation",
+            "description": "Save a confirmed reservation. Call once you have name, date, time, and party size.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":       {"type": "string",  "description": "Guest name"},
+                    "date":       {"type": "string",  "description": "Reservation date e.g. 'February 10th'"},
+                    "time":       {"type": "string",  "description": "Reservation time e.g. '6:00 PM'"},
+                    "party_size": {"type": "integer", "description": "Number of guests"},
+                },
+                "required": ["name", "date", "time", "party_size"],
             },
-            "required": ["name", "date", "time", "party_size"],
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_business_hours",
+            "description": "Get the restaurant's business hours.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_location",
+            "description": "Get the restaurant's address and location details.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_to_sales",
+            "description": "Transfer caller to the sales/events team for catering or large group inquiries.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_to_support",
+            "description": "Transfer caller to support for complaints or order issues.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+TOOL_RESPONSES = {
+    "get_business_hours": "We are open Monday through Sunday, 5 PM to 10 PM. Happy hour is 5 PM to 6:30 PM.",
+    "get_location": "We are located at 123 Main Street, Downtown. Parking is available in the garage next door.",
+    "transfer_to_sales": "I'll connect you to our events team. One moment please.",
+    "transfer_to_support": "I'll connect you to our support team. Can you briefly describe your issue?",
 }
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
@@ -133,6 +185,19 @@ async def log_call(caller: str, called: str) -> Optional[int]:
         logger.warning(f"DB log_call error: {e}")
         return None
 
+
+async def update_call_log(call_id: int, transcript: str, detected_intent: str, duration: int):
+    if not db_pool or not call_id:
+        return
+    try:
+        await db_pool.execute(
+            """UPDATE call_logs SET transcript=$1, detected_intent=$2,
+               duration_seconds=$3, call_status='completed' WHERE id=$4""",
+            transcript, detected_intent, duration, call_id,
+        )
+    except Exception as e:
+        logger.warning(f"DB update_call_log error: {e}")
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -143,7 +208,8 @@ async def lifespan(app: FastAPI):
             await db_pool.execute("""
                 CREATE TABLE IF NOT EXISTS call_logs (
                     id SERIAL PRIMARY KEY, caller_number TEXT, called_number TEXT,
-                    call_status TEXT DEFAULT 'started', transcript_summary TEXT,
+                    call_status TEXT DEFAULT 'started', transcript TEXT,
+                    detected_intent TEXT, duration_seconds INTEGER,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
@@ -194,14 +260,15 @@ async def answer_call(request: Request):
     call_uuid = form.get("CallUUID", "")
     logger.info(f"Incoming call: {caller} → {called} (UUID: {call_uuid})")
 
+    db_call_id = None
     if db_pool:
-        asyncio.create_task(log_call(caller, called))
+        db_call_id = await log_call(caller, called)
 
     if redis_client:
         try:
             await redis_client.setex(
                 f"call:{call_uuid}", 1800,
-                json.dumps({"caller": caller, "started": datetime.now(timezone.utc).isoformat()}),
+                json.dumps({"caller": caller, "started": datetime.now(timezone.utc).isoformat(), "db_call_id": db_call_id}),
             )
         except Exception as e:
             logger.warning(f"Redis error: {e}")
@@ -220,6 +287,16 @@ async def answer_call(request: Request):
   </Stream>
 </Response>"""
     return Response(content=xml, media_type="application/xml")
+
+
+@app.get("/call-logs")
+async def list_call_logs():
+    if not db_pool:
+        return JSONResponse({"error": "Database not configured"}, status_code=503)
+    rows = await db_pool.fetch(
+        "SELECT id, caller_number, called_number, detected_intent, duration_seconds, call_status, created_at FROM call_logs ORDER BY created_at DESC LIMIT 50"
+    )
+    return [dict(r) for r in rows]
 
 
 @app.get("/reservations")
@@ -321,33 +398,39 @@ async def save_reservation_db(name: str, date: str, time: str, party_size: int) 
     return confirmation
 
 
-async def get_ai_response(conversation: list) -> str:
+async def get_ai_response(conversation: list, detected_intents: list) -> str:
     resp = await openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=conversation,
-        tools=[RESERVATION_TOOL],
+        tools=TOOLS,
         tool_choice="auto",
         max_tokens=150,
         temperature=0.7,
     )
     choice = resp.choices[0]
 
-    # If the LLM wants to call save_reservation, do it and get a confirmation
     if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
         tool_call = choice.message.tool_calls[0]
-        args = json.loads(tool_call.function.arguments)
-        confirmation = await save_reservation_db(
-            name=args["name"],
-            date=args["date"],
-            time=args["time"],
-            party_size=args["party_size"],
-        )
-        # Feed result back to LLM so it can confirm to the caller
+        fn_name   = tool_call.function.name
+        args      = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+
+        detected_intents.append(fn_name)
+        logger.info(f"[TOOL] calling {fn_name} args={args}")
+
+        if fn_name == "save_reservation":
+            confirmation = await save_reservation_db(
+                name=args["name"], date=args["date"],
+                time=args["time"], party_size=args["party_size"],
+            )
+            tool_result = f"Reservation saved. Confirmation number: {confirmation}"
+        else:
+            tool_result = TOOL_RESPONSES.get(fn_name, "Done.")
+
         conversation.append(choice.message)
         conversation.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
-            "content": f"Reservation saved. Confirmation number: {confirmation}",
+            "content": tool_result,
         })
         follow_up = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -365,10 +448,14 @@ async def websocket_endpoint(websocket: WebSocket, call_uuid: str = ""):
     await websocket.accept()
     logger.info(f"Plivo WebSocket connected call_uuid={call_uuid}")
 
-    conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
-    send_lock    = asyncio.Lock()
-    active_tts   = None
-    ws_open      = True
+    conversation      = [{"role": "system", "content": SYSTEM_PROMPT}]
+    send_lock         = asyncio.Lock()
+    active_tts        = None
+    ws_open           = True
+    call_id           = None
+    detected_intents  = []
+    full_transcript   = []
+    call_start        = datetime.now(timezone.utc)
 
     async def handle_transcript(text: str):
         nonlocal active_tts
@@ -378,19 +465,22 @@ async def websocket_endpoint(websocket: WebSocket, call_uuid: str = ""):
         if not text:
             return
         logger.info(f"[USER] '{text}'")
+        full_transcript.append(f"User: {text}")
         if active_tts and not active_tts.done():
             active_tts.cancel()
         conversation.append({"role": "user", "content": text})
         try:
             logger.info("[LLM] calling OpenAI...")
-            ai_text = await get_ai_response(conversation)
+            ai_text = await get_ai_response(conversation, detected_intents)
             logger.info(f"[LLM] response: '{ai_text}'")
         except Exception as e:
             logger.error(f"[LLM] error: {e}", exc_info=True)
-            return
+            # Error recovery
+            ai_text = "I'm having trouble hearing you, could you repeat that?"
         if not ws_open:
             return
         conversation.append({"role": "assistant", "content": ai_text})
+        full_transcript.append(f"Agent: {ai_text}")
         active_tts = asyncio.create_task(stream_tts_to_plivo(websocket, ai_text, send_lock))
 
     # ── Deepgram setup ──────────────────────────────────────────────────────
@@ -431,8 +521,16 @@ async def websocket_endpoint(websocket: WebSocket, call_uuid: str = ""):
 
             if event == "start":
                 logger.info("Stream started — sending greeting")
+                # Retrieve call_id from Redis
+                if redis_client:
+                    try:
+                        raw = await redis_client.get(f"call:{call_uuid}")
+                        if raw:
+                            call_id = json.loads(raw).get("db_call_id")
+                    except Exception:
+                        pass
                 active_tts = asyncio.create_task(
-                    stream_tts_to_plivo(websocket, "Hi, thank you for calling Mario's Italian Kitchen! How can I help you today?", send_lock)
+                    stream_tts_to_plivo(websocket, "Hello, thank you for calling Mario's Italian Kitchen. How can I help you today?", send_lock)
                 )
 
             elif event == "media":
@@ -458,7 +556,12 @@ async def websocket_endpoint(websocket: WebSocket, call_uuid: str = ""):
         if active_tts and not active_tts.done():
             active_tts.cancel()
         await dg_conn.finish()
-        logger.info("Call ended")
+        duration = int((datetime.now(timezone.utc) - call_start).total_seconds())
+        intent_summary = ", ".join(detected_intents) if detected_intents else "general_inquiry"
+        transcript_text = "\n".join(full_transcript)
+        if call_id:
+            asyncio.create_task(update_call_log(call_id, transcript_text, intent_summary, duration))
+        logger.info(f"Call ended — duration={duration}s intent={intent_summary}")
 
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
